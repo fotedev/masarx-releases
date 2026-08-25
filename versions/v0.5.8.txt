@@ -1,7 +1,7 @@
 # Release v0.5.8
 
-- Source commit: 2b24b7c7a105043362ba12b30b7985377daaacd6
-- Workflow run: 32818428748
-- Date: 2026-08-25T06:49:28.2009564+00:00
+- Source commit: f9731c300c89a5cce70d5c8c9f899ffebd5ad0d7
+- Workflow run: 32819368854
+- Date: 2026-08-25T07:01:59.9759655+00:00
 
 This is a placeholder for the v0.5.8 Git tag in this repo. The actual release artifacts (.exe, latest.yml, blockmap) are attached as release assets.
