@@ -1,0 +1,10 @@
+﻿# Release v0.5.8
+
+- **Source commit**: 96e805b32e490fb8a0e7ea3c9b34fe1f6fc85ea6
+- **Built by**: GitHub Actions on fotedev/Masar-x-next
+- **Date**: 2026-08-25T05:51:29.0256865+02:00
+
+This file is a placeholder for the v0.5.8 Git tag in this repo.
+The actual release artifacts (.exe, latest.yml, blockmap) are
+attached as release assets — this marker just satisfies GitHub's
+requirement that release tags must exist in the target repo.
