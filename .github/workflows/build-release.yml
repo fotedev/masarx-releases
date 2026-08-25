@@ -94,12 +94,24 @@ jobs:
           # given public runners have generous disk.
 
       - name: Setup pnpm
+        # `version: 9.15.4` is REQUIRED. The default would read
+        # `packageManager` from the workflow's CWD, but the source
+        # is checked out at `source-code/`, so the root package.json
+        # (which has `packageManager: pnpm@9.15.4`) is not visible
+        # to the action. Pinning the version explicitly avoids the
+        # `No pnpm version is specified` error.
         uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: "pnpm"
+          # Lockfile is in the subdirectory checkout, not the
+          # runner's CWD — point the cache key generator at the
+          # right path.
+          cache-dependency-path: source-code/pnpm-lock.yaml
 
       - name: Install workspace dependencies
         working-directory: source-code
