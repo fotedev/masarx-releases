@@ -1,0 +1,221 @@
+# ============================================================================
+# Build & Release Desktop (Public Runner)
+#
+# Builds the Masar X Electron desktop installers (NSIS + Portable) on a
+# PUBLIC GitHub Actions runner (unlimited free minutes for public repos),
+# then publishes them as a GitHub Release on THIS repo
+# (fotedev/masarx-releases) via the default GITHUB_TOKEN.
+#
+# Why a public runner?
+# ---------------------
+# Source repo fotedev/Masar-x-next is PRIVATE → 3,000 min/month quota.
+# This repo (fotedev/masarx-releases) is PUBLIC → unlimited minutes.
+# Public-repo workflow logs are visible to anyone on the internet, so:
+#   1. We do NOT print any secret value to the log (`::add-mask::` on the
+#      first step, and a strict env allowlist below).
+#   2. We clean up the source-code checkout at the end of the job so a
+#      re-run or follow-up step cannot diff or echo the private source.
+#   3. The repo's Actions settings require approval for any outside-
+#      contributor PR (Settings → Actions → "Require approval for all
+#      external contributors"). Combined with `if: github.repository ==`
+#      below, a fork cannot run this even if the approval gate is bypassed.
+#
+# Authentication model
+# --------------------
+# - SOURCE_REPO_READ_TOKEN: Fine-grained PAT, Contents: Read-only, scoped
+#   to fotedev/Masar-x-next ONLY. Lets this workflow check out private
+#   source into the public runner. Cannot push, cannot read other repos.
+# - GITHUB_TOKEN (built-in): the public repo's auto-issued token. Used by
+#   electron-builder to push the release and assets back to THIS repo
+#   (the publish target in apps/desktop/electron-builder.yml already
+#   points here). electron-builder reads GH_TOKEN env var by default.
+#
+# Trigger
+# -------
+# workflow_dispatch ONLY. We do not use push:tags because tags pushed to
+# masarx-releases would be unrelated to source-code tags — they would
+# only ever point at the version-marker commits this workflow creates.
+# Operators pass the source-side tag (e.g. v0.5.9) as a required input.
+#
+# Required secrets on fotedev/masarx-releases
+# -------------------------------------------
+# - SOURCE_REPO_READ_TOKEN
+# - NEXT_PUBLIC_SUPABASE_URL
+# - NEXT_PUBLIC_SUPABASE_ANON_KEY
+# - NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME (optional, defaults to ci-placeholder)
+# - NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET (optional)
+# - NEXT_PUBLIC_SITE_URL
+# ============================================================================
+
+name: Build & Release Desktop (Public Runner)
+
+"on":
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Source repo tag to build (e.g. v0.5.9)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-public-${{ inputs.version_tag }}
+  cancel-in-progress: false
+
+# Default deny. The job opts in to what it needs.
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows installers
+    runs-on: windows-latest
+    # Defense in depth: never run on a fork, even if the fork's PR
+    # somehow passed the approval gate.
+    if: github.repository == 'fotedev/masarx-releases'
+
+    permissions:
+      contents: write   # needed for the "Mirror tag" push + electron-builder publish
+
+    steps:
+      - name: Mask the read token
+        # First step that touches the secret. ::add-mask:: prevents any
+        # subsequent accidental echo from leaking the value to the log.
+        run: echo "::add-mask::${{ secrets.SOURCE_REPO_READ_TOKEN }}"
+
+      - name: Checkout private source code
+        uses: actions/checkout@v4
+        with:
+          repository: fotedev/Masar-x-next
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          ref: ${{ inputs.version_tag }}
+          path: source-code
+          # Sparse checkout would be nicer but pnpm workspace symlinks
+          # don't survive it. Full checkout is ~150 MB — acceptable
+          # given public runners have generous disk.
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "pnpm"
+
+      - name: Install workspace dependencies
+        working-directory: source-code
+        # Root package.json has pnpm.neverBuiltDependencies: ["better-sqlite3"]
+        # so better-sqlite3's node-gyp postinstall is skipped. All other
+        # postinstalls (electron, esbuild, sharp, @swc/core) still run —
+        # in particular the electron postinstall downloads the Electron
+        # 32 binary that the next step relies on.
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Electron native modules
+        working-directory: source-code
+        # better-sqlite3 v11.10.0 ships electron-v128 prebuilds (Electron
+        # 32's ABI). The previous step skipped its postinstall, so we
+        # fetch the prebuild here via prebuild-install. Without this,
+        # first-launch of the desktop app crashes with ABI mismatch.
+        run: pnpm --filter desktop exec electron-builder install-app-deps
+
+      - name: Build Web standalone app
+        working-directory: source-code
+        # NEXT_PUBLIC_* vars are inlined into the client bundle at build
+        # time. The desktop installer packages this bundle via
+        # extraResources in apps/desktop/electron-builder.yml, so the
+        # values here must be the production Supabase / Cloudinary / site
+        # URL for the installed app to talk to the right backend.
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME: ${{ secrets.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME || 'ci-placeholder' }}
+          NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET: ${{ secrets.NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET || 'ci-placeholder' }}
+          NEXT_PUBLIC_SITE_URL: ${{ secrets.NEXT_PUBLIC_SITE_URL }}
+          NEXT_PUBLIC_COLLEGE_NAME: CI Placeholder
+          NEXT_PUBLIC_GA_ID: ""
+          ANALYZE: "false"
+          DATABASE_URL: postgresql://placeholder:placeholder@localhost:5432/placeholder
+          VERCEL_MCP_BYPASS_SECRET: ci-placeholder
+        run: pnpm --filter web build
+
+      - name: Mirror release tag to this repo
+        working-directory: source-code
+        # GitHub's releases API requires the tag to exist in the SAME
+        # repo as the release (422 Unprocessable Entity otherwise). We
+        # push a small "version marker" commit + tag here before the
+        # electron-builder publish step, so the public GITHUB_TOKEN can
+        # upload the release against an existing tag.
+        #
+        # We do NOT push the full source code (the source is private for
+        # a reason). Instead, we push a small marker file under a
+        # `versions/` subdirectory of THIS repo, then tag that commit.
+        # The `versions/` directory becomes a chronological index of
+        # releases — useful for debugging.
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tagName = "${{ inputs.version_tag }}"
+          $workDir = Join-Path $env:RUNNER_TEMP "mirror-tag-$tagName"
+          New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+          Push-Location $workDir
+          git clone --depth 1 --no-tags `
+            "https://x-access-token:$env:GH_TOKEN@github.com/${{ github.repository }}.git" `
+            _repo 2>&1 | Out-Null
+          Set-Location _repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          New-Item -ItemType Directory -Path versions -Force | Out-Null
+          $marker = "# Release $tagName`n`n- Workflow run: ${{ github.run_id }}`n- Date: $(Get-Date -Format 'o')`n`nTag anchor for electron-builder's GitHub release publish."
+          Set-Content -Path "versions/$tagName.txt" -Value $marker -Encoding UTF8 -NoNewline
+          git add versions/
+          git commit -m "release: tag anchor for $tagName" 2>&1 | Out-Null
+          git push origin HEAD:main 2>&1 | Out-Null
+          git tag $tagName
+          # --force: idempotent on re-runs. The version marker file's
+          # content captures the workflow run, so re-runs always reflect
+          # the most recent attempt.
+          git push --force origin $tagName 2>&1 | Out-Null
+          Write-Output "  mirrored $tagName to ${{ github.repository }} (commit: $(git rev-parse HEAD))"
+          Pop-Location
+
+      - name: Build & Publish Desktop installers
+        working-directory: source-code
+        # GH_TOKEN is the public repo's built-in GITHUB_TOKEN. electron-builder
+        # reads it from env to authenticate the GitHub Releases API call. The
+        # publish target in apps/desktop/electron-builder.yml already points
+        # to fotedev/masarx-releases (= this repo), so the built-in token
+        # has the right scope.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm --filter desktop run build:all
+
+      - name: List build artifacts
+        working-directory: source-code
+        shell: pwsh
+        run: |
+          Get-ChildItem apps/desktop/out/*.exe, apps/desktop/out/latest*.yml, apps/desktop/out/*.blockmap `
+            -ErrorAction SilentlyContinue |
+            Select-Object Name, @{N='SizeMB';E={[math]::Round($_.Length/1MB, 2)}} |
+            Format-Table -AutoSize
+
+      - name: Clean up source checkout
+        if: always()
+        # Removes the private source from the runner so a later step in
+        # this job (or a re-run) cannot accidentally echo or upload it.
+        # We use $GITHUB_WORKSPACE for an absolute path so this step works
+        # even if the `working-directory: source-code` of previous steps
+        # is no longer valid (e.g. a checkout failure).
+        shell: pwsh
+        run: |
+          $workDir = Join-Path $env:GITHUB_WORKSPACE "source-code"
+          if (Test-Path $workDir) {
+            # GitHub Actions runners (Linux/Windows VMs) are ephemeral —
+            # Remove-Item here is safe and will be auto-cleaned at job
+            # end anyway. We do it explicitly to free disk for any
+            # artifact upload step that might run after.
+            Remove-Item -Recurse -Force $workDir
+            Write-Output "  cleaned source-code/"
+          } else {
+            Write-Output "  source-code/ not present, nothing to clean"
+          }
